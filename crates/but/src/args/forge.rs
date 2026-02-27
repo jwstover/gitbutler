@@ -87,6 +87,16 @@ pub mod pr {
             /// Path to the review template file within the repository.
             template_path: Option<String>,
         },
+        /// Link existing open reviews from the forge to local branches.
+        /// Discovers reviews by matching source branch names and stores the association
+        /// in GitButler's branch metadata.
+        /// If no branch is specified, all linkable branches are linked automatically.
+        Link {
+            /// The branch to link a review for.
+            /// If not specified, all unlinked branches with matching reviews are linked.
+            #[clap(value_name = "BRANCH")]
+            branch: Option<String>,
+        },
     }
 }
 

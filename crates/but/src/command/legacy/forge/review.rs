@@ -275,6 +275,222 @@ pub fn set_review_template(
     Ok(())
 }
 
+/// The pure matching result from `compute_link_results()`, separate from warnings.
+struct ComputedLinkResults {
+    linked: Vec<LinkResult>,
+    already_linked: Vec<String>,
+    no_match: Vec<String>,
+    /// Branches that matched multiple reviews (we link the first one but warn).
+    multi_match_warnings: Vec<MultiMatchWarning>,
+}
+
+struct MultiMatchWarning {
+    branch_name: String,
+    unit_symbol: String,
+    review_number: i64,
+}
+
+/// Pure matching logic: categorizes branches into linked / already-linked / no-match
+/// without performing any side-effects (no `Context`, no I/O).
+fn compute_link_results(
+    review_map: &std::collections::HashMap<String, Vec<but_forge::ForgeReview>>,
+    applied_stacks: &[but_workspace::legacy::ui::StackEntry],
+    filter_branch_names: Option<&[String]>,
+) -> ComputedLinkResults {
+    let mut linked: Vec<LinkResult> = Vec::new();
+    let mut already_linked: Vec<String> = Vec::new();
+    let mut no_match: Vec<String> = Vec::new();
+    let mut multi_match_warnings: Vec<MultiMatchWarning> = Vec::new();
+
+    for stack_entry in applied_stacks {
+        for head in &stack_entry.heads {
+            let branch_name = head.name.to_string();
+
+            if let Some(filter) = filter_branch_names
+                && !filter.contains(&branch_name)
+            {
+                continue;
+            }
+
+            if head.review_id.is_some() {
+                already_linked.push(branch_name);
+                continue;
+            }
+
+            let reviews = review_map.get(&branch_name);
+            match reviews.map(|rs| rs.as_slice()) {
+                Some([review, ..]) => {
+                    if reviews.map(|rs| rs.len()).unwrap_or(0) > 1 {
+                        multi_match_warnings.push(MultiMatchWarning {
+                            branch_name: branch_name.clone(),
+                            unit_symbol: review.unit_symbol.clone(),
+                            review_number: review.number,
+                        });
+                    }
+                    linked.push(LinkResult {
+                        stack_id: stack_entry.id,
+                        branch: branch_name,
+                        review_number: review.number,
+                        review_url: review.html_url.clone(),
+                        unit_symbol: review.unit_symbol.clone(),
+                    });
+                }
+                Some([]) | None => {
+                    no_match.push(branch_name);
+                }
+            }
+        }
+    }
+
+    ComputedLinkResults {
+        linked,
+        already_linked,
+        no_match,
+        multi_match_warnings,
+    }
+}
+
+/// Link existing open reviews from the forge to local branches.
+/// Discovers reviews by matching source branch names and stores the association
+/// in GitButler's branch metadata.
+pub async fn link_reviews(
+    ctx: &mut Context,
+    branch: Option<String>,
+    out: &mut OutputChannel,
+) -> anyhow::Result<()> {
+    ensure_forge_authentication(ctx).await?;
+
+    let review_map = get_review_map(ctx, Some(but_forge::CacheConfig::NoCache))?;
+    let applied_stacks = but_api::legacy::workspace::stacks(
+        ctx,
+        Some(but_workspace::legacy::StacksFilter::InWorkspace),
+    )?;
+
+    // If a specific branch was passed, resolve it and filter
+    let filter_branch_names: Option<Vec<String>> = if let Some(branch_id) = branch {
+        Some(get_branch_names(&ctx.legacy_project, &branch_id)?)
+    } else {
+        None
+    };
+
+    let results =
+        compute_link_results(&review_map, &applied_stacks, filter_branch_names.as_deref());
+    let ComputedLinkResults {
+        linked,
+        already_linked,
+        no_match,
+        multi_match_warnings,
+    } = results;
+
+    // Emit warnings for branches with multiple matching reviews
+    for warn in &multi_match_warnings {
+        if let Some(out) = out.for_human() {
+            writeln!(
+                out,
+                "{}",
+                format!(
+                    "Warning: Multiple reviews found for '{}', linking to {}{}",
+                    warn.branch_name, warn.unit_symbol, warn.review_number
+                )
+                .yellow()
+            )?;
+        }
+    }
+
+    // Perform side effects: store the review number in branch metadata
+    for result in &linked {
+        let pr_number: Option<usize> = result.review_number.try_into().ok();
+        if let Some(stack_id) = result.stack_id {
+            but_api::legacy::stack::update_branch_pr_number(
+                ctx,
+                stack_id,
+                result.branch.clone(),
+                pr_number,
+            )
+            .ok();
+        }
+    }
+
+    if let Some(out) = out.for_human() {
+        for result in &linked {
+            writeln!(
+                out,
+                "Linked '{}' to {}{} ({})",
+                result.branch.green(),
+                result.unit_symbol,
+                result.review_number.to_string().blue(),
+                result.review_url
+            )?;
+        }
+
+        if linked.is_empty() && already_linked.is_empty() && no_match.is_empty() {
+            writeln!(out, "No branches found in workspace.")?;
+        } else if linked.is_empty() {
+            if !already_linked.is_empty() && no_match.is_empty() {
+                writeln!(out, "All branches are already linked to forge reviews.")?;
+            } else if !no_match.is_empty() && already_linked.is_empty() {
+                writeln!(
+                    out,
+                    "No matching forge reviews found for any unlinked branches."
+                )?;
+            } else {
+                writeln!(out, "No new links created.")?;
+            }
+        } else {
+            writeln!(out)?;
+            let linked_word = if linked.len() == 1 {
+                "branch"
+            } else {
+                "branches"
+            };
+            writeln!(
+                out,
+                "Linked {} {} to forge reviews.",
+                linked.len(),
+                linked_word
+            )?;
+        }
+        if !already_linked.is_empty() && !linked.is_empty() {
+            let word = if already_linked.len() == 1 {
+                "branch"
+            } else {
+                "branches"
+            };
+            writeln!(out, "{} {} already linked.", already_linked.len(), word)?;
+        }
+    }
+
+    if let Some(out) = out.for_json() {
+        let outcome = LinkReviewsOutcome {
+            linked,
+            already_linked,
+            no_match,
+        };
+        out.write_value(outcome)?;
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LinkResult {
+    #[serde(skip)]
+    stack_id: Option<StackId>,
+    branch: String,
+    review_number: i64,
+    review_url: String,
+    unit_symbol: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LinkReviewsOutcome {
+    linked: Vec<LinkResult>,
+    already_linked: Vec<String>,
+    no_match: Vec<String>,
+}
+
 /// Create a new forge review for a branch.
 /// If no branch is specified, prompts the user to select one.
 /// If there is only one branch without a an acco, asks for confirmation.
@@ -1398,5 +1614,182 @@ mod tests {
         let parsed = parse_review_ids("", &review_ids);
 
         assert!(parsed.is_empty());
+    }
+
+    // -- helpers for compute_link_results tests --
+
+    fn make_review(source_branch: &str, number: i64) -> but_forge::ForgeReview {
+        but_forge::ForgeReview {
+            html_url: format!("https://example.com/pr/{number}"),
+            number,
+            title: format!("PR {number}"),
+            body: None,
+            author: None,
+            labels: vec![],
+            draft: false,
+            source_branch: source_branch.to_string(),
+            target_branch: "main".to_string(),
+            sha: "abc123".to_string(),
+            created_at: None,
+            modified_at: None,
+            merged_at: None,
+            closed_at: None,
+            repository_ssh_url: None,
+            repository_https_url: None,
+            repo_owner: None,
+            reviewers: vec![],
+            unit_symbol: "#".to_string(),
+            last_sync_at: chrono::NaiveDateTime::default(),
+        }
+    }
+
+    fn make_head(name: &str, review_id: Option<usize>) -> but_workspace::legacy::ui::StackHeadInfo {
+        but_workspace::legacy::ui::StackHeadInfo {
+            name: name.into(),
+            tip: gix::ObjectId::null(gix::hash::Kind::Sha1),
+            review_id,
+            is_checked_out: false,
+        }
+    }
+
+    fn make_stack(
+        heads: Vec<but_workspace::legacy::ui::StackHeadInfo>,
+    ) -> but_workspace::legacy::ui::StackEntry {
+        but_workspace::legacy::ui::StackEntry {
+            id: Some(StackId::generate()),
+            heads,
+            tip: gix::ObjectId::null(gix::hash::Kind::Sha1),
+            order: None,
+            is_checked_out: false,
+        }
+    }
+
+    #[test]
+    fn link_matches_single_review_to_unlinked_branch() {
+        let mut review_map = std::collections::HashMap::new();
+        review_map.insert("feature-a".to_string(), vec![make_review("feature-a", 42)]);
+
+        let stacks = vec![make_stack(vec![make_head("feature-a", None)])];
+
+        let results = compute_link_results(&review_map, &stacks, None);
+
+        assert_eq!(results.linked.len(), 1);
+        assert_eq!(results.linked[0].branch, "feature-a");
+        assert_eq!(results.linked[0].review_number, 42);
+        assert!(results.already_linked.is_empty());
+        assert!(results.no_match.is_empty());
+        assert!(results.multi_match_warnings.is_empty());
+    }
+
+    #[test]
+    fn link_skips_already_linked_branch() {
+        let mut review_map = std::collections::HashMap::new();
+        review_map.insert("feature-b".to_string(), vec![make_review("feature-b", 10)]);
+
+        let stacks = vec![make_stack(vec![make_head("feature-b", Some(10))])];
+
+        let results = compute_link_results(&review_map, &stacks, None);
+
+        assert!(results.linked.is_empty());
+        assert_eq!(results.already_linked, vec!["feature-b"]);
+        assert!(results.no_match.is_empty());
+    }
+
+    #[test]
+    fn link_reports_no_match_when_no_review_exists() {
+        let review_map = std::collections::HashMap::new();
+
+        let stacks = vec![make_stack(vec![make_head("orphan-branch", None)])];
+
+        let results = compute_link_results(&review_map, &stacks, None);
+
+        assert!(results.linked.is_empty());
+        assert!(results.already_linked.is_empty());
+        assert_eq!(results.no_match, vec!["orphan-branch"]);
+    }
+
+    #[test]
+    fn link_handles_multiple_reviews_for_branch() {
+        let mut review_map = std::collections::HashMap::new();
+        review_map.insert(
+            "multi".to_string(),
+            vec![make_review("multi", 1), make_review("multi", 2)],
+        );
+
+        let stacks = vec![make_stack(vec![make_head("multi", None)])];
+
+        let results = compute_link_results(&review_map, &stacks, None);
+
+        assert_eq!(results.linked.len(), 1);
+        assert_eq!(
+            results.linked[0].review_number, 1,
+            "should link the first review"
+        );
+        assert_eq!(results.multi_match_warnings.len(), 1);
+        assert_eq!(results.multi_match_warnings[0].branch_name, "multi");
+    }
+
+    #[test]
+    fn link_filters_to_specific_branch() {
+        let mut review_map = std::collections::HashMap::new();
+        review_map.insert("keep".to_string(), vec![make_review("keep", 5)]);
+        review_map.insert("skip".to_string(), vec![make_review("skip", 6)]);
+
+        let stacks = vec![make_stack(vec![
+            make_head("keep", None),
+            make_head("skip", None),
+        ])];
+
+        let filter = vec!["keep".to_string()];
+        let results = compute_link_results(&review_map, &stacks, Some(&filter));
+
+        assert_eq!(results.linked.len(), 1);
+        assert_eq!(results.linked[0].branch, "keep");
+        assert!(
+            results.no_match.is_empty(),
+            "filtered-out branches are not reported as no_match"
+        );
+    }
+
+    #[test]
+    fn link_with_empty_stacks() {
+        let review_map = std::collections::HashMap::new();
+        let stacks: Vec<but_workspace::legacy::ui::StackEntry> = vec![];
+
+        let results = compute_link_results(&review_map, &stacks, None);
+
+        assert!(results.linked.is_empty());
+        assert!(results.already_linked.is_empty());
+        assert!(results.no_match.is_empty());
+    }
+
+    #[test]
+    fn link_mixed_scenario() {
+        let mut review_map = std::collections::HashMap::new();
+        review_map.insert(
+            "new-feature".to_string(),
+            vec![make_review("new-feature", 100)],
+        );
+        // no review for "stale-branch"
+        review_map.insert(
+            "linked-branch".to_string(),
+            vec![make_review("linked-branch", 200)],
+        );
+
+        let stacks = vec![
+            make_stack(vec![
+                make_head("new-feature", None),
+                make_head("stale-branch", None),
+            ]),
+            make_stack(vec![make_head("linked-branch", Some(200))]),
+        ];
+
+        let results = compute_link_results(&review_map, &stacks, None);
+
+        assert_eq!(results.linked.len(), 1);
+        assert_eq!(results.linked[0].branch, "new-feature");
+
+        assert_eq!(results.already_linked, vec!["linked-branch"]);
+        assert_eq!(results.no_match, vec!["stale-branch"]);
     }
 }

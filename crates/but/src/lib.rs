@@ -974,6 +974,12 @@ async fn match_subcommand(
                         .context("Failed to set reviews as ready-for-review.")
                         .emit_metrics(metrics_ctx)
                 }
+                Some(forge::pr::Subcommands::Link { branch }) => {
+                    command::legacy::forge::review::link_reviews(&mut ctx, branch, out)
+                        .await
+                        .context("Failed to link forge reviews to branches.")
+                        .emit_metrics(metrics_ctx)
+                }
                 None => {
                     // Default to `pr new` when no subcommand is provided
                     command::legacy::forge::review::create_review(
